@@ -16,8 +16,6 @@
 
 ## Usage
 
-
-
 ### 1. Prerequisites
 
 > Note that FEDER is only tested on Ubuntu OS with the following environments.
@@ -52,10 +50,6 @@ python Test.py  --testsize YOUR_IMAGESIZE  --pth_path YOUR_CHECKPOINTPATH  --tes
 
 The prediction results of our FEDER are stored on [Google Drive](https://drive.google.com/drive/folders/1Pho42bHiBhVR0l9KzdOFQgqLzr8mSv9e?usp=sharing) please check.
 
-
-
-
-
 ## Related Works
 [Weakly-Supervised Concealed Object Segmentation with SAM-based Pseudo Labeling and Multi-scale Feature Grouping](https://arxiv.org/abs/2305.11003), arxiv 2023.
 
@@ -80,3 +74,104 @@ If you have any questions, please feel free to contact me via email at chunmingh
 
 ## Acknowledgement
 The code is built on [SINet V2](https://github.com/GewelsJI/SINet-V2). Please also follow the corresponding licenses. Thanks for the awesome work.
+
+---
+
+# Fork notes (CSD361 extension)
+
+This fork adds three research extensions behind config flags, plus the fixes
+needed to run the released code at all. `scripts/README.md` is the runbook;
+this section is the map.
+
+## Running the released model
+
+Defaults reproduce FEDER exactly (`bands=2`, fixed Haar), so old checkpoints
+still load:
+
+```bash
+python -m pip install -r requirements-pip.txt     # NOT requirements.txt (see below)
+python tools/verify_data.py --root data/USEDATA --strict
+python tests/test_wavelet.py
+bash scripts/p1_01_sweep.sh
+```
+
+## What the flags do
+
+| flag | question it answers |
+|---|---|
+| `--bands K --learnable_wavelet` | **RQ1** — does a finer, learnable frequency decomposition help? |
+| `--band_weight none\|static\|adaptive` | **RQ1** — per-band adaptive weighting of the K bands. |
+| `--edge_feed kband` / `--ablate_mid` | **RQ3** — should the edge module see the mid bands? |
+| `--gf_radius` | resolution/cost study (changes the architecture — hold it fixed within a comparison) |
+
+## New modules and tools
+
+- `lib/WaveletKBand.py` — learnable K-band decomposition. Lifting steps make it
+  exactly invertible for any filter values, and it is numerically identical to
+  the released Haar DWT at initialisation, so the K=2 row *is* the baseline.
+- `lib/ModulesK.py` — `GCM3K` (band-wise aggregation for any K) and mid-band
+  fusion for RQ3.
+  MoCHi hard-negative mixing.
+- `lib/config.py` — one definition of the model flags, shared by every entry
+  point. Training writes `config.json` beside its checkpoints and the tools
+  read it back, so a checkpoint is always scored with the architecture that
+  produced it.
+- `tools/benchmark.py` — predict, score (S-α, F-w-β, E-φ, MAE, boundary-F) and
+  append a row to `results/results.csv` in one command.
+- `tools/band_report.py` — the per-band weights a trained model learned.
+- `tools/val_curve.py` — compares runs by mean-of-last-N validations, and says
+  when a gap is inside the noise.
+- `tools/measure_cost.py` — parameters, FLOPs, latency and peak memory, which
+  the paper reports only as a scatter plot.
+- `tests/test_wavelet.py` — 11 tests covering invertibility, Haar equivalence,
+  DC-freeness of the mid bands, and the resolution floor.
+
+## Upstream problems fixed here
+
+- **Encoder was randomly initialised.** `Network.py` shipped
+  `timm.create_model(..., pretrained=False)`; nothing else loaded a backbone,
+  so the released configuration cannot reproduce the paper. Now `pretrained=True`.
+- **`requirements.txt` is not installable.** It is a conda explicit spec list;
+  pip rejects lines like `_libgcc_mutex=0.1=main` (issue #8). Use
+  `requirements-pip.txt`.
+- **Single-GPU training crashed.** `--gpu_id` defaulted to `'4,5'` while
+  `device_ids` was hardcoded to `[0, 1]`. Device ids are now derived from what
+  is actually visible.
+- **`--load` restored weights only**, so an interrupted run restarted its
+  optimizer and LR schedule. `--resume` now restores model, optimizer, scaler,
+  epoch and the best-so-far metric.
+- **Resuming could overwrite the best checkpoint.** `last.pth` was written
+  before validation and the main block reset `best_mae` after the checkpoint
+  restored it, so the first validation after a resume always looked like an
+  improvement. Both are fixed; this matters because free-tier session limits
+  force multi-session training.
+- **`Test.py` could not load current checkpoints** (`torch.load(...).items()`
+  assumed a bare state_dict) and hardcoded GPU `'1'`.
+- **Odd input sizes broke the DWT** (issues #4, #9). The lifting transform
+  pads to even and crops on inverse.
+
+## The resolution floor — read before planning GPU time
+
+**256 does not work, and 384 is the minimum.** `AGF` builds a guided filter of
+radius 2 whose `h_lrx > 2r+1` assertion requires the coarsest band to exceed
+5 px; at 256 input that band is 4 px. Only **384, 448 and 512** run at the
+published radius — 320 fails the radius check and 416 produces an odd
+intermediate. This is a property of the *released* architecture, not of this
+extension.
+
+So a cheaper protocol must reduce **epochs**, not resolution. If you genuinely
+need 256, pass `--gf_radius 1` and hold it fixed across every row of the
+comparison, because it changes the architecture.
+
+## Measured cost (RTX 3050, 384 px, batch 1)
+
+| K | params | GFLOPs | latency | peak mem |
+|---|---|---|---|---|
+| 2 | 43.5 M | 35.9 | 166 ms | 415 MiB |
+| 3 | 43.8 M | 36.0 | 189 ms | 589 MiB |
+| 4 | 44.1 M | 36.0 | 222 ms | 426 MiB |
+| 6 | 44.8 M | 36.2 | 261 ms | 600 MiB |
+
+K barely moves FLOPs but costs real latency: each band adds its own sequential
+guided-filter aggregation path, which is memory-bound rather than FLOP-bound.
+Worth stating explicitly if you claim a K>2 result is cheap.

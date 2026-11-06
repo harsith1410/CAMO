@@ -1,0 +1,39 @@
+# Installable requirements for this fork.
+#
+# The upstream requirements.txt is a conda *explicit spec list*, not a pip
+# requirements file -- pip rejects lines like `_libgcc_mutex=0.1=main` (issue
+# #8). It is kept unchanged for reference; install from this file instead.
+#
+# These are the versions this fork is developed and tested against, on
+# Python 3.12 with CUDA 12.6. Nothing here needs the 2021 stack the paper used.
+#
+#   python -m venv .venv
+#   .venv/bin/pip install -r requirements-pip.txt          # Linux / Kaggle
+#   .venv\Scripts\pip install -r requirements-pip.txt      # Windows
+#
+# Install torch first if you need a specific CUDA build, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+torch>=2.4
+torchvision>=0.19
+
+# Encoder. pretrained=True in lib/Network.py pulls ImageNet resnet50 through
+# timm; the released code shipped pretrained=False and cannot reproduce.
+timm>=1.0
+
+numpy>=1.26
+opencv-python>=4.8
+pillow>=10.0
+tensorboardX>=2.6
+
+# Parameters and FLOPs for tools/measure_cost.py.
+thop>=0.1.1
+
+# Evaluation. Pinned to the 1.4 line: 1.5+ imports scikit-image at package
+# level, which drags in a large dependency tree for metrics this project does
+# not use. 1.4.x is also the version the COD literature reports against.
+pysodmetrics==1.4.2
+
+# Only needed for `tools/evaluate.py --crosscheck`, which scores the
+# from-scratch metric implementations against pysodmetrics.
+scipy>=1.11

@@ -1,16 +1,39 @@
 import os
+import random
 import torch
 import torch.nn.functional as F
 import numpy as np
 from datetime import datetime
 from torchvision.utils import make_grid
 from lib.Network import Network
+from lib.config import (add_model_args, build_network,
+                        describe, save_config)
 from utils.data_val import get_loader, test_dataset
 from utils.utils import clip_gradient, adjust_lr, get_coef,cal_ual
 from tensorboardX import SummaryWriter
 import logging
 import torch.backends.cudnn as cudnn
 from torch import optim
+
+
+def set_seed(seed):
+    """Seed every source of randomness that differs between runs.
+
+    This matters more than it looks. Each row of the comparison tables is
+    a separate process, so without a fixed seed the rows differ by weight
+    init, data order and augmentation as well as by the thing under test.
+    On the short schedules the deadline forces, that nuisance variation is
+    about 0.004 MAE -- larger than the effects being measured. Sharing a
+    seed pairs the rows so the difference is attributable to the change.
+
+    This is reproducible seeding, not bitwise determinism: cudnn.benchmark
+    stays on, so kernel choice can still vary. Making it exact would cost
+    speed we do not have.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def structure_loss(pred, mask):
@@ -115,6 +138,10 @@ def train(train_loader, model, optimizer, epoch, save_path, writer, scaler=None)
             epoch_step += 1
             loss_all += loss.data
 
+            if opt.limit_steps and i >= opt.limit_steps:
+                print('--limit_steps {}: ending epoch early (smoke run)'.format(opt.limit_steps))
+                break
+
             if i % 20 == 0 or i == total_step or i == 1:
                 print('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], Total_loss: {:.4f} Loss1: {:.4f} Loss2: {:0.4f} Loss3:{:0.4f}'.
                       format(datetime.now(), epoch, opt.epoch, i, total_step, loss.data, loss_init.data, loss_final.data, loss_edge.data))
@@ -122,9 +149,9 @@ def train(train_loader, model, optimizer, epoch, save_path, writer, scaler=None)
                     '[Train Info]:Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], Total_loss: {:.4f} Loss1: {:.4f} Loss2: {:0.4f} Loss3:{:0.4f}'.
                         format(epoch, opt.epoch, i, total_step, loss.data, loss_init.data, loss_final.data, loss_edge.data))
                 # TensorboardX-Loss
-                writer.add_scalars('Loss_Statistics',
-                                   {'Loss_init': loss_init.data, 'Loss_final': loss_final.data, 'Loss_edge': loss_edge.data, 'Loss_total': loss.data},
-                                   global_step=step)
+                scalars = {'Loss_init': loss_init.data, 'Loss_final': loss_final.data,
+                           'Loss_edge': loss_edge.data, 'Loss_total': loss.data}
+                writer.add_scalars('Loss_Statistics', scalars, global_step=step)
                 # TensorboardX-Training Data
                 grid_image = make_grid(images[0].clone().cpu().data, 1, normalize=True)
                 writer.add_image('RGB', grid_image, step)
@@ -150,14 +177,14 @@ def train(train_loader, model, optimizer, epoch, save_path, writer, scaler=None)
                 writer.add_image('Pred_edge', torch.tensor(res), step, dataformats='HW')
 
         loss_all /= epoch_step
-        logging.info('[Train Info]: Epoch [{:03d}/{:03d}], Loss_AVG: {:.4f}'.format(epoch, opt.epoch, loss_all))
+        logging.info('[Train Info]: Epoch [{:03d}/{:03d}], Loss_AVG: {:.4f}'.format(
+            epoch, opt.epoch, loss_all))
         writer.add_scalar('Loss-epoch', loss_all, global_step=epoch)
-        # Checkpoint every save_freq epochs, and always keep 'last'. The
-        # original saved only every 80 epochs and stored weights alone, so an
-        # interrupted run could not resume its optimizer or schedule.
-        save_checkpoint(save_path + 'last.pth', model, optimizer, epoch, scaler)
-        if epoch % opt.save_freq == 0:
-            save_checkpoint(save_path + 'Net_epoch_{}.pth'.format(epoch), model, optimizer, epoch, scaler)
+        # Checkpoints are written by the epoch loop *after* validation, so
+        # last.pth carries an up-to-date best_mae. Writing it here would
+        # record the best-so-far from before this epoch's validation, and a
+        # resume would then treat the next validation as an improvement and
+        # overwrite Net_epoch_best.pth with a worse model.
     except KeyboardInterrupt:
         print('Keyboard Interrupt: save model and exit.')
         if not os.path.exists(save_path):
@@ -176,7 +203,10 @@ def val(test_loader, model, epoch, save_path, writer, optimizer=None):
     with torch.no_grad():
         mae_sum = 0
         mae_sum_edge = 0
-        for i in range(test_loader.size):
+        n_val = test_loader.size
+        if opt.val_limit:
+            n_val = min(n_val, opt.val_limit)
+        for i in range(n_val):
             image, gt,  name, img_for_post = test_loader.load_data()
             gt = np.asarray(gt, np.float32)
             gt /= (gt.max() + 1e-8)
@@ -189,18 +219,18 @@ def val(test_loader, model, epoch, save_path, writer, optimizer=None):
             res = (res - res.min()) / (res.max() - res.min() + 1e-8)
             mae_sum += np.sum(np.abs(res - gt)) * 1.0 / (gt.shape[0] * gt.shape[1])
 
-        mae = mae_sum / test_loader.size
+        mae = mae_sum / n_val
         writer.add_scalar('MAE', torch.tensor(mae), global_step=epoch)
         print('Epoch: {}, MAE: {}, bestMAE: {}, bestEpoch: {}.'.format(epoch, mae, best_mae, best_epoch))
-        if epoch == 1:
+        # Straight comparison against the best so far, which load_checkpoint
+        # restores on resume. The original special-cased epoch 1 as "best"
+        # without writing a checkpoint, so a run whose first validation was
+        # also its last left no Net_epoch_best.pth at all.
+        if mae < best_mae:
             best_mae = mae
-            best_epoch = 1
-        else:
-            if mae < best_mae:
-                best_mae = mae
-                best_epoch = epoch
-                save_checkpoint(save_path + 'Net_epoch_best.pth', model, optimizer, epoch)
-                print('Save state_dict successfully! Best epoch:{}.'.format(epoch))
+            best_epoch = epoch
+            save_checkpoint(save_path + 'Net_epoch_best.pth', model, optimizer, epoch)
+            print('Save state_dict successfully! Best epoch:{}.'.format(epoch))
         logging.info(
             '[Val Info]:Epoch:{} MAE:{} bestEpoch:{} bestMAE:{}'.format(epoch, mae, best_epoch, best_mae))
 
@@ -217,6 +247,9 @@ if __name__ == '__main__':
     parser.add_argument('--decay_epoch', type=int, default=80, help='every n epochs decay learning rate')
     parser.add_argument('--load', type=str, default=None, help='train from checkpoints')
     parser.add_argument('--gpu_id', type=str, default='0', help='train use gpu')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='seed for init, data order and augmentation. Keep it '
+                             'identical across every row of a comparison table.')
     parser.add_argument('--amp', action='store_true',
                         help='mixed precision. Leave OFF for the baseline reproduction so the '
                              'protocol matches the paper; turn it on once your numbers match.')
@@ -227,6 +260,15 @@ if __name__ == '__main__':
                         help='validate every N epochs. The original validated every epoch at '
                              'batch size 1 over 2,026 images, a large share of wall clock.')
     parser.add_argument('--save_freq', type=int, default=10, help='checkpoint every N epochs')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='dataloader workers. Windows spawns processes rather '
+                             'than forking, so use 0-2 for short smoke runs.')
+    parser.add_argument('--limit_steps', type=int, default=0,
+                        help='stop each epoch after N steps. Smoke runs only -- '
+                             'a run with this set is not a result.')
+    parser.add_argument('--val_limit', type=int, default=0,
+                        help='validate on only the first N images. Smoke runs only; '
+                             'the MAE it reports is not comparable to a full one.')
     parser.add_argument('--resume', type=str, default=None,
                         help='resume from a full checkpoint (model + optimizer + epoch)')
     parser.add_argument('--train_root', type=str, default='./data/TrainDataset/',
@@ -234,12 +276,14 @@ if __name__ == '__main__':
     parser.add_argument('--val_root', type=str, default='./data/TestDataset/COD10K/',
                         help='the test rgb images root')
     parser.add_argument('--save_path', type=str,default='./snapshot/model_new/',help='the path to save model and log')
+    add_model_args(parser)
     opt = parser.parse_args()
 
 
 
     os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu_id
     cudnn.benchmark = True
+    set_seed(opt.seed)
     if not torch.cuda.is_available():
         raise SystemExit('No CUDA device visible. Check --gpu_id (you passed {!r}).'.format(opt.gpu_id))
 
@@ -248,13 +292,21 @@ if __name__ == '__main__':
     device_ids = list(range(torch.cuda.device_count()))
     print('USE GPU {} -> {} visible device(s)'.format(opt.gpu_id, len(device_ids)))
 
-    model = Network(channels=96)
+    print('CONFIG: ' + describe(opt))
+    model = build_network(opt)
+
     if len(device_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
     model = model.cuda(device=device_ids[0])
 
     optimizer = torch.optim.Adam(model.parameters(), opt.lr)
     scaler = torch.amp.GradScaler('cuda', enabled=opt.amp)
+
+    # Must be initialised before load_checkpoint, which restores them on
+    # resume. Setting them after would discard the restored best-so-far and
+    # let the next validation overwrite Net_epoch_best.pth with a worse model.
+    best_mae = 1
+    best_epoch = 0
 
     start_epoch = 1
     if opt.resume is not None:
@@ -266,6 +318,9 @@ if __name__ == '__main__':
     save_path = opt.save_path
     if not os.path.exists(save_path):
         os.makedirs(save_path)
+    # Record what built this run so Test.py and the tools can rebuild the
+    # same architecture instead of being told it again on the command line.
+    save_config(os.path.join(save_path, 'config.json'), opt)
 
     # load data
     print('load data...')
@@ -274,7 +329,8 @@ if __name__ == '__main__':
                               edge_root=opt.train_root + 'Edge/',
                               batchsize=opt.batchsize,
                               trainsize=opt.trainsize,
-                              num_workers=8)
+                              num_workers=opt.num_workers,
+                              generator=torch.Generator().manual_seed(opt.seed))
     val_loader = test_dataset(image_root=opt.val_root + 'Imgs/',
                               gt_root=opt.val_root + 'GT/',
                               testsize=opt.trainsize)
@@ -289,12 +345,12 @@ if __name__ == '__main__':
     logging.info('Config: epoch: {}; lr: {}; batchsize: {}; trainsize: {}; clip: {}; decay_rate: {}; load: {}; '
                  'save_path: {}; decay_epoch: {}'.format(opt.epoch, opt.lr, opt.batchsize, opt.trainsize, opt.clip,
                                                          opt.decay_rate, opt.load, save_path, opt.decay_epoch))
+    logging.info('Model: {}; amp: {}; accum_steps: {}; effective_batch: {}'.format(
+        describe(opt), opt.amp, opt.accum_steps, opt.batchsize * opt.accum_steps))
 
     step = 0
     writer = SummaryWriter(save_path + 'summary')
-    best_mae = 1
-    best_epoch = 0
-    
+
     # learning rate schedule
     cosine_schedule = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=20, eta_min=1e-5)
     print("Start train...")
@@ -314,4 +370,10 @@ if __name__ == '__main__':
         train(train_loader, model, optimizer, epoch, save_path, writer, scaler)
         if epoch % opt.val_freq == 0 or epoch == opt.epoch:
             val(val_loader, model, epoch, save_path, writer, optimizer)
+
+        # After validation, so the restored best_mae is current on resume.
+        save_checkpoint(save_path + 'last.pth', model, optimizer, epoch, scaler)
+        if epoch % opt.save_freq == 0:
+            save_checkpoint(save_path + 'Net_epoch_{}.pth'.format(epoch),
+                            model, optimizer, epoch, scaler)
 

@@ -177,16 +177,20 @@ class PolypObjDataset(data.Dataset):
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
+    # The augmentations in this file use the `random` module, not numpy,
+    # so seeding numpy alone left flips/crops/rotations unreproducible.
+    random.seed(worker_seed)
 
 # dataloader for training
-def get_loader(image_root, gt_root, edge_root, batchsize, trainsize, shuffle=True, num_workers=12, pin_memory=True):
+def get_loader(image_root, gt_root, edge_root, batchsize, trainsize, shuffle=True, num_workers=12, pin_memory=True, generator=None):
     dataset = PolypObjDataset(image_root, gt_root, edge_root, trainsize)
     data_loader = data.DataLoader(dataset=dataset,
                                   batch_size=batchsize,
                                   shuffle=shuffle,
                                   num_workers=num_workers,
                                   pin_memory=pin_memory,
-                                  worker_init_fn=seed_worker)
+                                  worker_init_fn=seed_worker,
+                                  generator=generator)
     return data_loader
 
 

@@ -130,3 +130,7 @@ dmypy.json
 data
 snapshot
 
+
+# Prediction maps are regenerable from checkpoints; results.csv is not.
+res
+snapshot/
