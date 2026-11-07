@@ -13,6 +13,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Resolve the interpreter. Git Bash on Windows does not inherit the venv that
+# a PowerShell "(.venv)" prompt advertises, and the `python` it does find is
+# usually a system install without torch -- which fails later and less
+# obviously. So prefer the venv explicitly, and refuse to guess.
+if [ -z "${PY:-}" ]; then
+  for cand in ./.venv/Scripts/python.exe ./.venv/bin/python python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+  done
+fi
+if [ -z "${PY:-}" ]; then
+  echo "No python found. Activate the venv, or pass PY=/path/to/python." >&2
+  exit 1
+fi
+if ! "$PY" -c "import torch" >/dev/null 2>&1; then
+  echo "ERROR: '$PY' cannot import torch." >&2
+  echo "       On Windows use: PY=./.venv/Scripts/python.exe bash $0" >&2
+  exit 1
+fi
+echo "interpreter: $PY"
+
 EPOCHS=${EPOCHS:-25}
 BS=${BS:-4}                # batchsize * ACC must be 36: the 1e-4 LR was tuned there.
 ACC=${ACC:-9}              # 6 GB laptop card: 4 * 9. On 24 GB use BS=12 ACC=3.
@@ -40,7 +60,7 @@ for K in $KS; do
   RESUME=""
   if [ -f "$RUN/last.pth" ]; then RESUME="--resume $RUN/last.pth"; echo "resuming"; fi
 
-  python Train.py \
+  "$PY" Train.py \
     --epoch "$EPOCHS" --lr 1e-4 --batchsize "$BS" --accum_steps "$ACC" \
     --trainsize "$SIZE" --seed "$SEED" $AMP --val_freq 5 --save_freq 5 \
     --bands "$K" --learnable_wavelet --band_weight adaptive --edge_feed kband \
@@ -48,14 +68,14 @@ for K in $KS; do
     --val_root   ./data/USEDATA/TestDataset/COD10K/ \
     --save_path "$RUN/" $RESUME
 
-  python tools/benchmark.py --pth "$RUN/Net_epoch_best.pth" \
+  "$PY" tools/benchmark.py --pth "$RUN/Net_epoch_best.pth" \
     --datasets COD10K --testsize "$SIZE" \
     --tag "K=$K adaptive kband$TAGSEED" --notes "$NOTE"
 done
 
 echo
 echo "=== how the rows actually compare ==="
-python tools/val_curve.py snapshot/p1_k* --last 3
+"$PY" tools/val_curve.py snapshot/p1_k* --last 3
 
 cat <<'EOF'
 

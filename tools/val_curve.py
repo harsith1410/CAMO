@@ -11,6 +11,12 @@ the single best of five such draws rewards luck, and the luck differs per row.
 So for short runs, compare the mean of the last few validations rather than
 the best one, and look at the spread before believing any ordering.
 
+That only holds if the tail is FLAT. If the curve is still descending, the
+mean over the window mixes a half-trained model with its final one, and it
+rewards whichever run happened to converge earliest rather than whichever
+ends up best -- which is exactly backwards. This script checks for that and
+falls back to ranking by best when the tail has not settled.
+
 Usage:
     python tools/val_curve.py snapshot/rq1_k*            # compare runs
     python tools/val_curve.py snapshot/rq1_k3 --last 3   # window size
@@ -87,7 +93,14 @@ def main():
             print('no validation lines in {}'.format(t))
             continue
         tail = [v for _, v in curve[-a.last:]]
+        # Is the tail flat? Compare the drop across the window with the
+        # scatter inside it. A window that falls by much more than it wobbles
+        # is still descending, so its mean is not a converged value.
+        drop = tail[0] - tail[-1] if len(tail) > 1 else 0.0
+        sd_tail = st.stdev(tail) if len(tail) > 1 else 0.0
+        settled = abs(drop) <= 2 * sd_tail if sd_tail > 0 else True
         rows.append(dict(
+            settled=settled, drop=drop,
             name=os.path.basename(os.path.normpath(t)),
             n=len(curve),
             last_ep=curve[-1][0],
@@ -100,24 +113,56 @@ def main():
     if not rows:
         return 1
 
-    print('\n{:<24} {:>5} {:>8} {:>7} {:>10} {:>8}'.format(
-        'run', 'vals', 'best', '@ep', 'mean/last%d' % a.last, 'sd'))
-    print('-' * 66)
-    for r in sorted(rows, key=lambda r: r['mean']):
-        print('{:<24} {:>5} {:>8.5f} {:>7} {:>10.5f} {:>8.5f}'.format(
-            r['name'], r['n'], r['best'], r['best_ep'], r['mean'], r['sd']))
+    # If any run's tail is still descending, the mean is the wrong statistic
+    # for every run -- ranking has to use a like-for-like value instead.
+    all_settled = all(r['settled'] for r in rows)
+    key = 'mean' if all_settled else 'best'
+
+    print('\n{:<24} {:>5} {:>8} {:>7} {:>10} {:>8} {:>8}'.format(
+        'run', 'vals', 'best', '@ep', 'mean/last%d' % a.last, 'sd', 'tail'))
+    print('-' * 76)
+    for r in sorted(rows, key=lambda r: r[key]):
+        print('{:<24} {:>5} {:>8.5f} {:>7} {:>10.5f} {:>8.5f} {:>8}'.format(
+            r['name'], r['n'], r['best'], r['best_ep'], r['mean'], r['sd'],
+            'flat' if r['settled'] else 'falling'))
+
+    if not all_settled:
+        print('\nAt least one curve is still descending at the end of its run, '
+              'so the mean')
+        print('over the window is not a converged number -- it favours '
+              'whichever run')
+        print('settled earliest rather than whichever ends up best. Ranked by '
+              'BEST above.')
+
+    # The sharpest available check on whether these runs can be ranked at all:
+    # if the two statistics disagree about the winner, they cannot.
+    by_best = sorted(rows, key=lambda r: r['best'])[0]['name']
+    by_mean = sorted(rows, key=lambda r: r['mean'])[0]['name']
+    if len(rows) > 1 and by_best != by_mean:
+        print('\n*** best and mean disagree: {} wins on best, {} wins on mean.'
+              .format(by_best, by_mean))
+        print('    A ranking that flips with the statistic is not a ranking. '
+              'Whatever')
+        print('    separates these runs is smaller than the run-to-run noise, '
+              'and no')
+        print('    choice of summary will fix that -- it needs more epochs or '
+              'more seeds.')
+        print('    Rank on the test-set metric from tools/benchmark.py '
+              'instead; validation')
+        print('    MAE is a proxy and a noisy one at short schedules.')
 
     for r in rows:
         print('\n{}: {}'.format(r['name'], '  '.join(
             'ep{}={:.5f}'.format(e, v) for e, v in r['curve'])))
 
     if len(rows) > 1:
-        ranked = sorted(rows, key=lambda r: r['mean'])
+        ranked = sorted(rows, key=lambda r: r[key])
         a0, b0 = ranked[0], ranked[1]
-        gap = b0['mean'] - a0['mean']
+        gap = b0[key] - a0[key]
         noise = max(x for x in (a0['sd'], b0['sd']) if x == x)
-        print('\nbest two: {} beats {} by {:.5f} MAE; '
-              'within-run spread is {:.5f}.'.format(a0['name'], b0['name'], gap, noise))
+        print('\nbest two (by {}): {} beats {} by {:.5f} MAE; '
+              'within-run spread is {:.5f}.'.format(
+                  key, a0['name'], b0['name'], gap, noise))
         if gap < noise:
             print('That gap is SMALLER than the noise. Report it as a tie -- '
                   'ranking these two needs more epochs or more seeds.')

@@ -15,6 +15,26 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Resolve the interpreter. Git Bash on Windows does not inherit the venv that
+# a PowerShell "(.venv)" prompt advertises, and the `python` it does find is
+# usually a system install without torch -- which fails later and less
+# obviously. So prefer the venv explicitly, and refuse to guess.
+if [ -z "${PY:-}" ]; then
+  for cand in ./.venv/Scripts/python.exe ./.venv/bin/python python3 python py; do
+    if command -v "$cand" >/dev/null 2>&1; then PY="$cand"; break; fi
+  done
+fi
+if [ -z "${PY:-}" ]; then
+  echo "No python found. Activate the venv, or pass PY=/path/to/python." >&2
+  exit 1
+fi
+if ! "$PY" -c "import torch" >/dev/null 2>&1; then
+  echo "ERROR: '$PY' cannot import torch." >&2
+  echo "       On Windows use: PY=./.venv/Scripts/python.exe bash $0" >&2
+  exit 1
+fi
+echo "interpreter: $PY"
+
 BEST_K=${BEST_K:?set BEST_K from the stage 1 table, e.g. BEST_K=3 bash $0}
 # The reference baseline peaks at epoch 110 and gains nothing after it, so 100
 # is a cheap place to stop. Overnight cost on a 24 GB Ada in fp32, including
@@ -30,7 +50,7 @@ AMP=${AMP:-}               # off: the hours below assume fp32
 RESUME=""
 if [ -f "$RUN/last.pth" ]; then RESUME="--resume $RUN/last.pth"; echo "resuming"; fi
 
-python Train.py \
+"$PY" Train.py \
   --epoch "$EPOCHS" --lr 1e-4 --batchsize "$BS" --accum_steps "$ACC" \
   --trainsize 384 --seed "$SEED" $AMP --val_freq 5 --save_freq 10 \
   --bands "$BEST_K" --learnable_wavelet --band_weight adaptive --edge_feed kband \
@@ -40,17 +60,17 @@ python Train.py \
 
 # Keep the maps: the qualitative figure needs them and regenerating costs
 # another full inference pass over 6473 images.
-python tools/benchmark.py --pth "$RUN/Net_epoch_best.pth" \
+"$PY" tools/benchmark.py --pth "$RUN/Net_epoch_best.pth" \
   --datasets COD10K NC4K CAMO CHAMELEON --save_maps \
   --tag "Part 1 final K=$BEST_K" \
   --notes "384px ${EPOCHS}ep eff-batch $((BS*ACC)) seed=${SEED} AMP K=${BEST_K} adaptive kband"
 
 echo
 echo "Learned per-band weights:"
-python tools/band_report.py --pth "$RUN/Net_epoch_best.pth" || true
+"$PY" tools/band_report.py --pth "$RUN/Net_epoch_best.pth" || true
 
 echo
-python tools/make_tables.py --table part1 --out results/tables_part1.md || true
+"$PY" tools/make_tables.py --table part1 --out results/tables_part1.md || true
 
 cat <<'EOF'
 
@@ -62,7 +82,7 @@ Two things to do before this goes in the report:
 2. Build the qualitative figure from the saved maps, and include failure
    cases, not just the flattering ones:
 
-   python tools/make_figures.py \
+   "$PY" tools/make_figures.py \
      --imgs data/USEDATA/TestDataset/COD10K/Imgs \
      --gt   data/USEDATA/TestDataset/COD10K/GT \
      --pred "FEDER:res/baseline/COD10K" \
