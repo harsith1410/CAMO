@@ -1,0 +1,2 @@
+timestamp,tag,checkpoint,dataset,protocol,n_images,sm,wfm,em_mean,em_adp,mae,boundary_f,pub_sm,d_sm,notes
+2026-11-12T18:21:40,Final 100ep K=2,snapshot\p1_final\Net_epoch_best.pth,COD10K,384px K=2 learnable hf=hh edge=kband bw=adaptive r=2,2026,0.8189088048953597,0.6996394676948833,0.8897084455746143,0.8908290839432955,0.033702041614526626,0.43798002165554606,0.844,-0.0251,
